@@ -1,0 +1,154 @@
+name: Build ImmortalWrt Firmware (Universal)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'ImmortalWrt 源码仓库地址'
+        required: true
+        default: 'https://github.com/immortalwrt/immortalwrt'
+      repo_branch:
+        description: '源码分支/Tag (如 master, openwrt-23.05, openwrt-24.10)'
+        required: true
+        default: 'master'
+  push:
+    paths:
+      - '.config'
+      - 'custom_feeds.conf'
+  schedule:
+    - cron: '0 20 * * *' # 每天北京时间早上 04:00 自动检测源码更新并编译
+
+env:
+  DEFAULT_REPO_URL: https://github.com/immortalwrt/immortalwrt
+  DEFAULT_REPO_BRANCH: master
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write # 赋予 Release 自动发布权限
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Initialization Environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -a -f
+          sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google-chrome* dotnet* powershell openjdk* mysql* php* mongodb* moby* snapd*
+          sudo -E apt-get update
+          sudo -E apt-get -y install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cgi-builder device-tree-compiler flex gawk gcc-multilib g++-multilib gettext git git-core git-doc gnutls-bin gzip help2man intltool lib32gcc-s1 lib32stdc++6 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pyelftools python3-pip qemu-utils rsync scons squashfs-tools subversion swig texinfo u-boot-tools unittest-cpp unzip vim wget xmlto xz-utils zlib1g-dev
+          sudo -E apt-get clean
+          sudo timedatectl set-timezone "$TZ"
+          sudo mkdir -p /workdir
+          sudo chown $USER:$GROUPS /workdir
+
+      - name: Clone Source Code
+        run: |
+          REPO_URL="${{ github.event.inputs.repo_url }}"
+          REPO_BRANCH="${{ github.event.inputs.repo_branch }}"
+          
+          [ -z "$REPO_URL" ] && REPO_URL="$DEFAULT_REPO_URL"
+          [ -z "$REPO_BRANCH" ] && REPO_BRANCH="$DEFAULT_REPO_BRANCH"
+          
+          echo "Cloning $REPO_URL ($REPO_BRANCH)..."
+          git clone --depth 1 $REPO_URL -b$REPO_BRANCH /workdir/immortalwrt
+          ln -sf /workdir/immortalwrt $GITHUB_WORKSPACE/immortalwrt
+
+      - name: Merge Custom Feeds (Safe Mode)
+        run: |
+          cd immortalwrt
+          CUSTOM_FEEDS="$GITHUB_WORKSPACE/custom_feeds.conf"
+          
+          if [ -f "$CUSTOM_FEEDS" ]; then
+            echo "发现自定义 custom_feeds.conf，开始安全合并..."
+            while IFS= read -r line || [ -n "$line" ]; do
+              [[ -z "$line" \vert{}\vert{} "$line" =~ ^[[:space:]]*# ]] && continue
+              FEED_NAME=$(echo "$line" | awk '{print $2}')
+              if [ -n "$FEED_NAME" ]; then
+                sed -i "/^[[:space:]]*src-.*[[:space:]]\+${FEED_NAME}[[:space:]]\+/d" feeds.conf.default
+                echo "$line" >> feeds.conf.default
+                echo "合并 Feed: $FEED_NAME"
+              fi
+            done < "$CUSTOM_FEEDS"
+          fi
+
+      - name: Update & Install Feeds
+        run: |
+          cd immortalwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Load Custom Configuration (.config)
+        run: |
+          CONFIG_FILE="$GITHUB_WORKSPACE/.config"
+          if [ -f "$CONFIG_FILE" ]; then
+            cp "$CONFIG_FILE" immortalwrt/.config
+            cd immortalwrt
+            make defconfig
+          else
+            echo "错误：未找到 .config 文件！"
+            exit 1
+          fi
+
+      - name: Download Package Toolchain & Source
+        run: |
+          cd immortalwrt
+          make download -j8
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -rf {} \;
+
+      - name: Compile Firmware
+        id: compile
+        run: |
+          cd immortalwrt
+          echo "开启分布式多核编译..."
+          make -j$(($(nproc) + 1)) || make -j1 || make -j1 V=s
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Organize Firmware Files
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          cd immortalwrt/bin/targets/*/*
+          rm -rf packages # 排除通用的 ipk 目录
+          
+          # 生成 sha256 校验文件
+          sha256sum * > sha256sums 2>/dev/null || true
+          
+          echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
+          
+          BUILD_TAG="ImmortalWrt_$(date +'%Y.%m.%d-%H%M')"
+          echo "RELEASE_TAG=$BUILD_TAG" >> $GITHUB_ENV
+          echo "RELEASE_TITLE=ImmortalWrt 固件发布 ($BUILD_TAG)" >> $GITHUB_ENV
+
+      - name: Generate Release Notes
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          cd immortalwrt
+          echo "### 🛠️ 编译信息" > release_body.txt
+          echo "- **源码仓库**: ${{ github.event.inputs.repo_url || env.DEFAULT_REPO_URL }}" >> release_body.txt
+          echo "- **分支**: ${{ github.event.inputs.repo_branch || env.DEFAULT_REPO_BRANCH }}" >> release_body.txt
+          echo "- **源码 Commit**: $(git rev-parse --short HEAD)" >> release_body.txt
+          echo "- **构建时间**: $(date '+%Y-%m-%d %H:%M:%S')" >> release_body.txt
+          echo "" >> release_body.txt
+          echo "### 📦 文件列表及 SHA256 校验" >> release_body.txt
+          echo "\`\`\`" >> release_body.txt
+          cat "${{ env.FIRMWARE_PATH }}/sha256sums" >> release_body.txt 2>/dev/null || echo "无校验文件" >> release_body.txt
+          echo "\`\`\`" >> release_body.txt
+          
+          echo "RELEASE_BODY_PATH=$PWD/release_body.txt" >> $GITHUB_ENV
+
+      - name: Upload Firmware to GitHub Release
+        if: steps.compile.outputs.status == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TITLE }}
+          body_path: ${{ env.RELEASE_BODY_PATH }}
+          files: ${{ env.FIRMWARE_PATH }}/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
